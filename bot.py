@@ -7,6 +7,9 @@ from discord.ext import commands
 import sqlite3
 from datetime import datetime, timezone
 import asyncio
+from logs import log_edit
+from ui import edit_result_embed
+from config import VEHICLES
 
 # ================== НАСТРОЙКИ ==================
 
@@ -18,21 +21,6 @@ UPDATE_INTERVAL = 30
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# ================== ТЕХНИКА ==================
-
-VEHICLES = {
-    "Логистика": 1,
-    "Легкобронированная техника": 2,
-    "Легкие танки": 3,
-    "Средние танки": 5,
-    "Тяжелые танки": 8,
-    "Разведывательные самолеты": 3,
-    "Малая авиация": 5,
-    "Крупная авиация": 8,
-    "Малый флот": 4,
-    "Крупный флот": 10
-}
 
 # ================== БАЗА ДАННЫХ ==================
 
@@ -69,6 +57,20 @@ CREATE TABLE IF NOT EXISTS live_messages (
     leaderboard_msg INTEGER,
     vehicles_msg INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS edit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    war_id INTEGER,
+    editor_id INTEGER,
+    target_id INTEGER,
+    vehicle TEXT,
+    display_name TEXT,
+    delta INTEGER,
+    before_count INTEGER,
+    after_count INTEGER,
+    points_delta INTEGER,
+    created_at TEXT
+);
 """)
 db.commit()
 
@@ -92,7 +94,10 @@ async def on_ready():
 
 # ================== START WAR ==================
 
-@bot.tree.command(name="start_war", description="Начать новую войну")
+@bot.tree.command(name="начать_войну", description="Начать новую войну")
+@app_commands.rename(
+    number="номер"
+)
 async def start_war(interaction: discord.Interaction, number: str):
     # ─── проверка: существует ли война с таким номером ───
     cursor.execute("SELECT id FROM wars WHERE name = ?", (number,))
@@ -145,11 +150,16 @@ def is_officer(member: discord.Member) -> bool:
 
 
 
-@bot.tree.command(name="destroy", description="Отметить уничтоженную технику")
+@bot.tree.command(name="уничтожил", description="Отметить уничтоженную технику")
 @app_commands.describe(
     vehicle="Категория техники",
     amount="Количество",
     custom_name="Кастомное название техники (опционально)"
+)
+@app_commands.rename(
+    vehicle="техника",
+    amount="количество",
+    custom_name="название"
 )
 @app_commands.choices(vehicle=[app_commands.Choice(name=v, value=v) for v in VEHICLES])
 async def destroy(
@@ -194,7 +204,7 @@ async def destroy(
 # ================== ОФИЦЕРСКОЕ РЕДАКТИРОВАНИЕ ==================
 
 @bot.tree.command(
-    name="edit_destroy",
+    name="изменить",
     description="[Офицеры] Исправить запись уничтоженной техники"
 )
 @app_commands.describe(
@@ -202,6 +212,12 @@ async def destroy(
     vehicle="Категория техники",
     delta="На сколько изменить значение (может быть отрицательным)",
     custom_name="Кастомное название техники (опционально)"
+)
+@app_commands.rename(
+    user="игрок",
+    vehicle="техника",
+    delta="кол-во",
+    custom_name="название"
 )
 @app_commands.choices(vehicle=[app_commands.Choice(name=v, value=v) for v in VEHICLES])
 async def edit_destroy(
@@ -228,7 +244,6 @@ async def edit_destroy(
         return
 
     war_id, _ = war
-
     display_name = custom_name.strip() if custom_name else vehicle.value
 
     # ─── текущее значение ───
@@ -246,29 +261,41 @@ async def edit_destroy(
     row = cursor.fetchone()
     current = row[0] if row else 0
 
-    new_value = max(0, current + delta)
+    new_value = current + delta
 
-    # ─── обновляем / создаём запись ───
-    if row:
+    if new_value <= 0:
         cursor.execute(
             """
-            UPDATE stats
-            SET count = ?
+            DELETE FROM stats
             WHERE user_id = ?
               AND war_id = ?
               AND vehicle = ?
               AND display_name = ?
             """,
-            (new_value, user.id, war_id, vehicle.value, display_name)
+            (user.id, war_id, vehicle.value, display_name)
         )
+        new_value = 0
     else:
-        cursor.execute(
-            """
-            INSERT INTO stats (user_id, war_id, vehicle, display_name, count)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user.id, war_id, vehicle.value, display_name, new_value)
-        )
+        if row:
+            cursor.execute(
+                """
+                UPDATE stats
+                SET count = ?
+                WHERE user_id = ?
+                  AND war_id = ?
+                  AND vehicle = ?
+                  AND display_name = ?
+                """,
+                (new_value, user.id, war_id, vehicle.value, display_name)
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO stats (user_id, war_id, vehicle, display_name, count)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user.id, war_id, vehicle.value, display_name, new_value)
+            )
 
     # ─── пересчёт очков ───
     points_delta = VEHICLES[vehicle.value] * delta
@@ -285,19 +312,151 @@ async def edit_destroy(
         """,
         (points_delta, user.id, war_id)
     )
+    log_edit(
+        cursor,
+        war_id,
+        interaction.user.id,
+        user.id,
+        vehicle.value,
+        display_name,
+        delta,
+        current,
+        new_value,
+        points_delta
+    )
 
     db.commit()
 
     await interaction.response.send_message(
-        f"🛠 **Исправление внесено**\n"
-        f"Игрок: **{user.display_name}**\n"
-        f"Категория: **{vehicle.value}**\n"
-        f"Техника: **{display_name}**\n"
-        f"Было: {current} → Стало: {new_value}\n"
-        f"Очки изменены на: {points_delta}"
+        embed=edit_result_embed(
+            user,
+            vehicle.value,
+            display_name,
+            current,
+            new_value,
+            points_delta
+        )
     )
 
-# ================== ОБЩАЯ ЛОГИКА СТАТИСТИКИ ==================
+    # --------- ЛОГИ ЭДИТОВ
+
+@bot.tree.command(
+    name="логи",
+    description="[Офицеры] Последние правки"
+)
+async def edit_log(interaction: discord.Interaction):
+    if not is_officer(interaction.user):
+        await interaction.response.send_message(
+            "❌ У тебя нет прав офицера",
+            ephemeral=True
+        )
+        return
+
+    cursor.execute(
+        """
+        SELECT editor_id, target_id, vehicle, display_name, delta, created_at
+        FROM edit_logs
+        ORDER BY id DESC
+        LIMIT 10
+        """
+    )
+    rows = cursor.fetchall()
+
+    if not rows:
+        await interaction.response.send_message("📭 Нет правок")
+        return
+
+    lines = []
+    for editor_id, target_id, vehicle, name, delta, created_at in rows:
+        lines.append(
+            f"👤 <@{editor_id}> → <@{target_id}>\n"
+            f"🚗 {vehicle} / {name}\n"
+            f"Δ {delta:+} | 🕒 {created_at[:16]} UTC\n"
+        )
+
+    await interaction.response.send_message("\n".join(lines))
+
+    # ------------ ОТКАТ ЭДИТОВ
+
+@bot.tree.command(
+    name="откат",
+    description="[Офицеры] Откат последней правки"
+)
+async def undo_edit(interaction: discord.Interaction):
+    if not is_officer(interaction.user):
+        await interaction.response.send_message(
+            "❌ У тебя нет прав офицера",
+            ephemeral=True
+        )
+        return
+
+    cursor.execute(
+        """
+        SELECT id, war_id, target_id, vehicle, display_name,
+               before_count, after_count, points_delta
+        FROM edit_logs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    row = cursor.fetchone()
+
+    if not row:
+        await interaction.response.send_message("📭 Нет правок для отката")
+        return
+
+    (
+        log_id,
+        war_id,
+        target_id,
+        vehicle,
+        display_name,
+        before_count,
+        after_count,
+        points_delta
+    ) = row
+
+    if before_count <= 0:
+        cursor.execute(
+            """
+            DELETE FROM stats
+            WHERE user_id = ? AND war_id = ?
+              AND vehicle = ? AND display_name = ?
+            """,
+            (target_id, war_id, vehicle, display_name)
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO stats (user_id, war_id, vehicle, display_name, count)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, war_id, display_name)
+            DO UPDATE SET count = ?
+            """,
+            (target_id, war_id, vehicle, display_name, before_count, before_count)
+        )
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET points = points - ?
+        WHERE user_id = ? AND war_id = ?
+        """,
+        (points_delta, target_id, war_id)
+    )
+
+    cursor.execute("DELETE FROM edit_logs WHERE id = ?", (log_id,))
+    db.commit()
+
+    await interaction.response.send_message(
+        f"↩️ **Правка отменена**\n"
+        f"Игрок: <@{target_id}>\n"
+        f"Техника: **{display_name}**\n"
+        f"Count: {after_count} → {before_count}\n"
+        f"Очки: {-points_delta:+}"
+    )
+
+    # ================== ОБЩАЯ ЛОГИКА СТАТИСТИКИ ==================
 
 async def show_stats(interaction, war_number, target, vehicle=None):
     # ─── война ───
@@ -348,6 +507,7 @@ async def show_stats(interaction, war_number, target, vehicle=None):
         FROM stats
         WHERE user_id = ? AND war_id = ?
         GROUP BY vehicle, display_name
+        HAVING SUM(count) > 0
         ORDER BY vehicle, total DESC
         """,
         (target.id, war_id)
@@ -371,13 +531,24 @@ async def show_stats(interaction, war_number, target, vehicle=None):
     )
 
     from collections import defaultdict
+
     grouped = defaultdict(list)
 
+    # собираем данные, сразу игнорируя 0
     for vehicle, name, count in rows:
-        grouped[vehicle].append((name, count))
+        if count > 0:
+            grouped[vehicle].append((name, count))
 
+    # выводим
     for vehicle, items in grouped.items():
-        text = "\n".join(f"• {name} — {count}" for name, count in items)
+        if not items:
+            continue
+
+        text = "\n".join(
+            f"• {name} — {count}"
+            for name, count in items
+        )
+
         embed.add_field(
             name=f"🚗 {vehicle}",
             value=text,
@@ -389,8 +560,13 @@ async def show_stats(interaction, war_number, target, vehicle=None):
 
 # ================== STATS ==================
 
-@bot.tree.command(name="stats", description="Статистика игрока")
+@bot.tree.command(name="статистика", description="Статистика игрока")
 @app_commands.describe(war="Номер войны", user="Игрок", vehicle="Тип техники")
+@app_commands.rename(
+    war="война",
+    user="игрок",
+    vehicle="техника"
+)
 @app_commands.choices(vehicle=[app_commands.Choice(name=v, value=v) for v in VEHICLES])
 async def stats(interaction, war: str | None = None, user: discord.Member | None = None, vehicle: app_commands.Choice[str] | None = None):
     await show_stats(
@@ -402,9 +578,9 @@ async def stats(interaction, war: str | None = None, user: discord.Member | None
 
 # ================== HISTORY ==================
 
-history = app_commands.Group(name="history", description="История войн")
+history = app_commands.Group(name="история", description="История войн")
 
-@history.command(name="list")
+@history.command(name="список")
 async def history_list(interaction):
     cursor.execute("SELECT name, started_at FROM wars WHERE active = 0 ORDER BY started_at DESC LIMIT 10")
     rows = cursor.fetchall()
@@ -418,11 +594,17 @@ async def history_list(interaction):
 
     await interaction.response.send_message(embed=embed)
 
-@history.command(name="war")
+@history.command(name="война")
+@app_commands.rename(
+    war="номер"
+)
 async def history_war(interaction, war: str):
     await show_stats(interaction, war, interaction.user)
 
-@history.command(name="top")
+@history.command(name="топ")
+@app_commands.rename(
+    war="номер"
+)
 async def history_top(interaction, war: str):
     data = get_war_by_number(war)
     if not data:
